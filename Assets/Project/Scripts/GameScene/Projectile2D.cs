@@ -1,4 +1,5 @@
-﻿using Unity.Netcode;
+﻿// Projectile2D.cs
+using Unity.Netcode;
 using Unity.Netcode.Components;
 using UnityEngine;
 
@@ -15,6 +16,10 @@ public class Projectile2D : NetworkBehaviour
 
     [Tooltip("Offset in Grad für die Sprite-Ausrichtung: Sprite zeigt nach oben = -90, nach rechts = 0.")]
     public float rotationOffsetDegrees = -90f;
+
+    [Header("VFX")]
+    [Tooltip("Particle-Prefab für Explosion (kein NetworkObject nötig).")]
+    public GameObject explosionPrefab;
 
     private Rigidbody2D rb;
     private Collider2D col;
@@ -47,6 +52,10 @@ public class Projectile2D : NetworkBehaviour
         rb.simulated = true;
         rb.isKinematic = !IsServer;
 
+        // DEBUG: prüfen, ob Shooter-Daten schon da sind
+        Debug.Log($"[Projectile2D.OnNetworkSpawn] IsServer={IsServer} IsSpawned={GetComponent<NetworkObject>()?.IsSpawned} " +
+                  $"shooterCid={shooterClientId} shooterNo={shooterObjectId} moveDir={moveDir}");
+
         if (IsServer)
         {
             if (moveDir.sqrMagnitude < 0.0001f)
@@ -63,24 +72,31 @@ public class Projectile2D : NetworkBehaviour
         base.OnNetworkDespawn();
     }
 
-    /// <summary>Nur SERVER: direkt nach Instantiate und VOR Spawn(true) aufrufen.</summary>
+    /// <summary>
+    /// Direkt nach Instantiate und VOR Spawn(true) aufrufen.
+    /// WICHTIG: KEIN Early-Return mehr; bei unspawned Objects kann IsServer false sein.
+    /// </summary>
     public void Init(Vector2 dir, ulong shooterClient, ulong shooterNoId)
     {
-        if (!IsServer) return;
-
+        // Shooter-Infos IMMER setzen (wir rufen das sowieso serverseitig auf)
         shooterClientId = shooterClient;
         shooterObjectId = shooterNoId;
 
         moveDir = dir.sqrMagnitude > 0.0001f ? dir.normalized : (Vector2)transform.up;
 
+        if (rb == null) rb = GetComponent<Rigidbody2D>();
         rb.linearVelocity = moveDir * speed;
 
         float angle = Mathf.Atan2(moveDir.y, moveDir.x) * Mathf.Rad2Deg + rotationOffsetDegrees;
         rb.SetRotation(angle);
         rb.WakeUp();
+
+        Debug.Log($"[Projectile2D.Init] assigned shooterCid={shooterClientId} shooterNo={shooterObjectId} " +
+                  $"IsServerNow={IsServer} IsSpawned={(GetComponent<NetworkObject>()?.IsSpawned ?? false)} " +
+                  $"dir={moveDir}");
     }
 
-    // optional: Überladung falls irgendwo noch 2-Param-Aufrufe existieren
+    // Optional: 2-Param-Überladung, falls alter Aufruf irgendwo steht
     public void Init(Vector2 dir, ulong shooterClient)
     {
         Init(dir, shooterClient, 0);
@@ -101,20 +117,51 @@ public class Projectile2D : NetworkBehaviour
     {
         if (!IsServer) return;
 
+        // Robuste Trefferdaten (keine aufwendige Distanzabfrage)
+        Vector3 hitPos = transform.position;
+        float hitAngleZ = Mathf.Atan2(moveDir.y, moveDir.x) * Mathf.Rad2Deg + rotationOffsetDegrees;
+
         // Schiff über Parent finden (deckt Child-Collider ab)
         var ship = other.GetComponentInParent<ShipControllerInputSystem>();
         if (ship)
         {
-            // Kein Schaden am Schützen selbst (objektbasiert)
-            if (ship.NetworkObjectId != shooterObjectId)
-                ship.ApplyDamageFromPlayerServerRpc(damage, shooterClientId);
+            // Self-Hit verhindern (objektbasiert)
+            if (shooterObjectId == 0 || ship.NetworkObjectId != shooterObjectId)
+            {
+                // Killer-ClientId sicher auflösen: erst Feld, dann per NO-Owner nachschlagen
+                ulong attackerCidResolved = shooterClientId;
 
+                if (shooterObjectId != 0 &&
+                    NetworkManager != null &&
+                    NetworkManager.SpawnManager != null &&
+                    NetworkManager.SpawnManager.SpawnedObjects.TryGetValue(shooterObjectId, out var shooterNO) &&
+                    shooterNO != null)
+                {
+                    attackerCidResolved = shooterNO.OwnerClientId;
+                }
+
+                Debug.Log($"[Projectile2D] HIT -> victimCid={ship.OwnerClientId} victimNo={ship.NetworkObjectId} " +
+                          $"rawShooterCid={shooterClientId} rawShooterNo={shooterObjectId} resolvedShooterCid={attackerCidResolved}");
+
+                // Direkter Server-Call + Angreifer-Objekt-ID mitschicken
+                ship.ApplyDamageFromPlayerServer(damage, attackerCidResolved, shooterObjectId);
+            }
+            else
+            {
+                Debug.Log($"[Projectile2D] SELF-HIT prevented by NO check. shooterNo={shooterObjectId} victimNo={ship.NetworkObjectId}");
+            }
+
+            // Explosion zuerst (vor Despawn), lokal per ClientRpc
+            PlayExplosionClientRpc(hitPos, hitAngleZ);
             Despawn();
             return;
         }
 
+        // Asteroid / Umwelt
         if (other.CompareTag("Asteroid") || other.GetComponent<AsteroidHazard>() != null)
         {
+            Debug.Log($"[Projectile2D] HIT ENV -> pos={hitPos} tag={other.tag}");
+            PlayExplosionClientRpc(hitPos, hitAngleZ);
             Despawn();
         }
     }
@@ -124,6 +171,15 @@ public class Projectile2D : NetworkBehaviour
         var no = GetComponent<NetworkObject>();
         if (IsServer && no && no.IsSpawned) no.Despawn();
         else Destroy(gameObject);
+    }
+
+    // ---------- VFX RPC ----------
+
+    [ClientRpc]
+    private void PlayExplosionClientRpc(Vector3 worldPos, float angleZ)
+    {
+        if (!explosionPrefab) return;
+        Instantiate(explosionPrefab, worldPos, Quaternion.Euler(0f, 0f, angleZ));
     }
 
 #if UNITY_EDITOR

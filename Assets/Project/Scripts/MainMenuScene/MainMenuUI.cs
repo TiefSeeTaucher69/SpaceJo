@@ -28,6 +28,10 @@ public class MainMenuUI : MonoBehaviour
     [Tooltip("Optional: TMP-Text für Status/Fehlerausgaben.")]
     public TMP_Text feedbackText;
 
+    [Header("Quit")]
+    [Tooltip("Beendet das Spiel vollständig.")]
+    public Button quitGameBtn;
+
     private bool heartbeatRunning;
 
     void Start()
@@ -40,6 +44,17 @@ public class MainMenuUI : MonoBehaviour
         if (openJoinPanelBtn) openJoinPanelBtn.onClick.AddListener(() => ToggleJoinPanel(true));
         if (joinCancelBtn) joinCancelBtn.onClick.AddListener(() => ToggleJoinPanel(false));
         if (joinConfirmBtn) joinConfirmBtn.onClick.AddListener(() => { _ = JoinById(); });
+
+        // Quit Game
+        if (quitGameBtn)
+        {
+#if UNITY_WEBGL && !UNITY_EDITOR
+            // WebGL kann nicht „quitten“ -> Button ausblenden
+            quitGameBtn.gameObject.SetActive(false);
+#else
+            quitGameBtn.onClick.AddListener(QuitGame);
+#endif
+        }
 
         // Panel initial aus
         if (joinPanel) joinPanel.SetActive(false);
@@ -222,6 +237,19 @@ public class MainMenuUI : MonoBehaviour
         }
     }
 
+    // ---------------- Quit Game (komplett beenden) ----------------
+
+    void QuitGame()
+    {
+        // Falls du hier noch etwas speichern/cleanup machen willst, tu es vor dem Quit.
+
+#if UNITY_EDITOR
+        UnityEditor.EditorApplication.isPlaying = false;
+#else
+        Application.Quit();
+#endif
+    }
+
     // ---------------- Helpers ----------------
 
     async Task HostHeartbeat(string lobbyId)
@@ -248,6 +276,7 @@ public class MainMenuUI : MonoBehaviour
         if (openJoinPanelBtn) openJoinPanelBtn.interactable = enabled;
         if (joinConfirmBtn) joinConfirmBtn.interactable = enabled;
         if (joinCancelBtn) joinCancelBtn.interactable = enabled;
+        if (quitGameBtn) quitGameBtn.interactable = enabled;
     }
 
     void SetFeedback(string msg)
@@ -262,14 +291,11 @@ public class MainMenuUI : MonoBehaviour
         heartbeatRunning = false;
     }
 
-    // --- NEU: Szene mit bereits sichtbarem Overlay laden (echter Progress) ---
+    // --- Szene mit bereits sichtbarem Overlay laden (echter Progress) ---
     private async Task LoadSceneWhileShown(string sceneName, string labelWhileLoading = null)
     {
         if (LoadingOverlay.I != null && !string.IsNullOrEmpty(labelWhileLoading))
             LoadingOverlay.I.SetProgress(0f); // reset
-
-        // Optional: Label ändern, falls gewünscht
-        // (Wenn dein LoadingOverlay eine SetStatus-Methode anbietet, könntest du die hier nutzen.)
 
         var op = SceneManager.LoadSceneAsync(sceneName, LoadSceneMode.Single);
         op.allowSceneActivation = false;

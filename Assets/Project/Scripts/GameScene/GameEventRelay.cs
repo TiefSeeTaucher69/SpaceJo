@@ -1,94 +1,106 @@
+// Assets/Project/Scripts/GameScene/GameEventRelay.cs
 using System.Collections.Generic;
-using Unity.Netcode;
 using UnityEngine;
+using Unity.Netcode;
 
-public enum DeathCause : byte { Projectile = 0, Asteroid = 1, Quit = 2, Other = 3 }
-
-/// <summary>
-/// Serverseitiger Event-Hub: sammelt Spielernamen, broadcastet Statusmeldungen.
-/// </summary>
 public class GameEventRelay : NetworkBehaviour
 {
-    public static GameEventRelay Instance { get; private set; }
+    public static GameEventRelay Instance;
 
-    private readonly Dictionary<ulong, string> _names = new();
+    private readonly Dictionary<ulong, string> _nameByCid = new();
 
     void Awake()
     {
+        if (Instance != null && Instance != this) { Destroy(gameObject); return; }
         Instance = this;
     }
 
     public override void OnNetworkSpawn()
     {
-        if (IsServer && NetworkManager != null)
+        if (IsServer)
         {
-            NetworkManager.OnClientDisconnectCallback += OnClientDisconnected;
+            NetworkManager.OnClientDisconnectCallback += OnClientDisconnect;
         }
+        base.OnNetworkSpawn();
     }
 
     public override void OnNetworkDespawn()
     {
         if (IsServer && NetworkManager != null)
-            NetworkManager.OnClientDisconnectCallback -= OnClientDisconnected;
-
-        if (Instance == this) Instance = null;
+            NetworkManager.OnClientDisconnectCallback -= OnClientDisconnect;
+        base.OnNetworkDespawn();
     }
-
-    // ---------- Names ----------
 
     [ServerRpc(RequireOwnership = false)]
-    public void RegisterNameServerRpc(string displayName, ServerRpcParams rp = default)
+    public void RegisterNameServerRpc(string displayName, ServerRpcParams rpc = default)
     {
-        var cid = rp.Receive.SenderClientId;
-        _names[cid] = San(displayName);
+        var cid = rpc.Receive.SenderClientId;
+        var clean = Sanitize(displayName);
+        _nameByCid[cid] = clean;
+        Debug.Log($"[GameEventRelay] RegisterName cid={cid} name='{clean}'");
     }
 
-    private string GetName(ulong clientId)
-    {
-        if (_names.TryGetValue(clientId, out var n) && !string.IsNullOrWhiteSpace(n))
-            return n;
-        return $"Player {clientId}";
-    }
-
-    private static string San(string s) => string.IsNullOrWhiteSpace(s) ? "" : s.Trim();
-
-    // ---------- Public Server helpers ----------
-
-    // Kill (A tötet B)
-    public void ServerAnnounceKill(ulong killerCid, ulong victimCid, DeathCause cause = DeathCause.Projectile)
+    // --- Host-Leaving-Broadcast (graceful) ---
+    public void ServerBroadcastHostLeaving()
     {
         if (!IsServer) return;
-        var k = GetName(killerCid);
-        var v = GetName(victimCid);
-        string msg = cause == DeathCause.Projectile ? $"{k} killed {v}" : $"{k} killed {v} ({cause})";
-        AnnounceClientRpc(msg);
+        Debug.Log("[GameEventRelay] ServerBroadcastHostLeaving -> HostLeavingClientRpc()");
+        HostLeavingClientRpc();
     }
 
-    // Suizid/Environment (B tötet sich selbst)
+    [ClientRpc]
+    private void HostLeavingClientRpc()
+    {
+        Debug.Log("[GameEventRelay] HostLeavingClientRpc received.");
+        HostLeaveManager.I?.OnHostLeavingRpcReceived();
+    }
+
+    // --- Status/Killfeed ---
+    public void ServerAnnounceKill(ulong attackerCid, ulong victimCid, DeathCause cause)
+    {
+        if (!IsServer) return;
+        string killer = GetName(attackerCid);
+        string victim = GetName(victimCid);
+        Debug.Log($"[GameEventRelay] KILL -> killerCid={attackerCid}('{killer}') victimCid={victimCid}('{victim}') cause={cause}");
+        BroadcastToastClientRpc($"{killer} killed {victim}");
+    }
+
     public void ServerAnnounceSuicide(ulong victimCid, DeathCause cause)
     {
         if (!IsServer) return;
-        var v = GetName(victimCid);
-        string why = cause == DeathCause.Asteroid ? " (asteroid)" : "";
-        AnnounceClientRpc($"{v} killed himself{why}");
+        string victim = GetName(victimCid);
+        Debug.Log($"[GameEventRelay] SUICIDE -> victimCid={victimCid}('{victim}') cause={cause}");
+        BroadcastToastClientRpc($"{victim} killed himself");
     }
 
-    // Spieler hat das Spiel verlassen
-    private void OnClientDisconnected(ulong clientId)
+    public void ServerAnnounceLeft(ulong cid)
     {
         if (!IsServer) return;
-        var n = GetName(clientId);
-        AnnounceClientRpc($"{n} left the game");
+        Debug.Log($"[GameEventRelay] LEFT -> cid={cid}('{GetName(cid)}')");
+        BroadcastToastClientRpc($"{GetName(cid)} left the game");
     }
-
-    // ---------- Broadcast ----------
 
     [ClientRpc]
-    private void AnnounceClientRpc(string message)
+    private void BroadcastToastClientRpc(string line)
     {
-        if (StatusToastUI.I != null)
-            StatusToastUI.I.Show(message);
-        else
-            Debug.Log($"[Toast] {message}");
+        if (StatusToastUI.I != null) StatusToastUI.I.Show(line);
+        else Debug.Log($"[Toast] {line}");
     }
+
+    private void OnClientDisconnect(ulong cid)
+    {
+        if (_nameByCid.ContainsKey(cid))
+            BroadcastToastClientRpc($"{_nameByCid[cid]} left the game");
+
+        _nameByCid.Remove(cid);
+    }
+
+    private string GetName(ulong cid)
+    {
+        if (_nameByCid.TryGetValue(cid, out var n) && !string.IsNullOrWhiteSpace(n))
+            return n;
+        return cid == 0 ? "Host" : $"Player {cid}";
+    }
+
+    private static string Sanitize(string s) => string.IsNullOrWhiteSpace(s) ? "" : s.Trim();
 }

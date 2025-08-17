@@ -1024,7 +1024,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!224 &618456135
 RectTransform:
   m_ObjectHideFlags: 0
@@ -1859,12 +1859,12 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: c961e659e5d18af419df0aa126019128, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
+  loginPanel: {fileID: 618456134}
   usernameField: {fileID: 341393863}
   passwordField: {fileID: 966180648}
   signUpBtn: {fileID: 1152526682}
   signInBtn: {fileID: 1946313089}
   feedback: {fileID: 112558044}
-  busyOverlay: {fileID: 0}
 --- !u!4 &1189835795
 Transform:
   m_ObjectHideFlags: 0

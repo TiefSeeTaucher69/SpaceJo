@@ -29,7 +29,6 @@ public class AsteroidHazard : NetworkBehaviour
     void OnCollisionEnter2D(Collision2D c)
     {
         if (!IsServer) return; // nur Server macht Gameplay-Logik
-
         if (!c.collider.TryGetComponent<ShipControllerInputSystem>(out var ship))
             return;
 
@@ -43,13 +42,13 @@ public class AsteroidHazard : NetworkBehaviour
         float speed = v.magnitude;
         if (speed < minImpactSpeedForBounce) return; // sehr langsam → ignorieren
 
-        // Bounce-Richtung (Reflexion) berechnen
+        // Bounce-Richtung (Reflexion)
         Vector2 reflected = Vector2.Reflect(v, n) * bounceMultiplier;
 
-        // Server setzt physikalisch direkt (Server-Authority)
+        // Server setzt physikalisch direkt
         rb.linearVelocity = reflected;
 
-        // Schiff über Knockback informieren (Clients bekommen Sperre via RPC)
+        // Knockback-Info
         ship.ApplyKnockbackServer(reflected);
 
         // Schaden nur wenn schnell genug UND Cooldown vorbei
@@ -61,11 +60,10 @@ public class AsteroidHazard : NetworkBehaviour
             {
                 lastHitTime[id] = now;
 
-                // optional leicht mit Speed skalieren
                 int dmg = Mathf.RoundToInt(baseDamage * Mathf.Clamp01((speed - minImpactSpeedForDamage) / 5f));
                 if (dmg <= 0) dmg = baseDamage;
 
-                // >>> Umweltschaden mit Cause "Asteroid" für Killfeed/Toast
+                // <<< Umwelt-Schaden mit Cause "Asteroid" -> richtiger Toast (Suizid)
                 ship.ApplyDamageFromEnvironmentServerRpc(dmg, (int)DeathCause.Asteroid);
             }
         }

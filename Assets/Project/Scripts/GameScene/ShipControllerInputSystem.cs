@@ -1,3 +1,4 @@
+// ShipControllerInputSystem.cs
 using Unity.Netcode;
 using Unity.Netcode.Components;
 using UnityEngine;
@@ -28,8 +29,16 @@ public class ShipControllerInputSystem : NetworkBehaviour
     [Header("Knockback")]
     public float knockbackDuration = 0.3f;
 
+    [Header("VFX")]
+    [Tooltip("Particle-Prefab für Muzzle Flash (kein NetworkObject nötig).")]
+    public GameObject muzzleFlashPrefab;
+    [Tooltip("Offset des Muzzle-Flash entlang der Schussrichtung (kann negativ sein).")]
+    public float muzzleFlashOffset = -0.2f; // näher am Schiff
+
     private bool inKnockback = false;
     private float knockbackTimer = 0f;
+
+    private bool isDead = false; // sperrt Eingaben/Feuer während Tod
 
     private Rigidbody2D rb;
     private SpaceshipControls controls;
@@ -48,7 +57,6 @@ public class ShipControllerInputSystem : NetworkBehaviour
         rb.collisionDetectionMode = CollisionDetectionMode2D.Continuous;
 
         AutoAssignMuzzle();
-
         spawnPos = transform.position;
         spawnRot = transform.rotation;
     }
@@ -77,19 +85,17 @@ public class ShipControllerInputSystem : NetworkBehaviour
     {
         if (IsServer) hp.Value = maxHp;
 
-        // Server simuliert Physik, Clients sind kinematic
         rb.simulated = IsServer;
         rb.bodyType = RigidbodyType2D.Dynamic;
         rb.isKinematic = !IsServer;
 
-        // >>> Name beim Server registrieren (für Killfeed/Toasts)
+        // Name für Killfeed registrieren
         if (IsOwner && GameEventRelay.Instance != null)
         {
             var myName = string.IsNullOrWhiteSpace(UgsBootstrap.DisplayName) ? $"Player {OwnerClientId}" : UgsBootstrap.DisplayName;
             GameEventRelay.Instance.RegisterNameServerRpc(myName);
         }
 
-        // Input nur beim Owner abgreifen
         if (IsOwner)
         {
             if (controls == null) controls = new SpaceshipControls();
@@ -103,7 +109,6 @@ public class ShipControllerInputSystem : NetworkBehaviour
 
     public override void OnNetworkDespawn() { TeardownInput(); base.OnNetworkDespawn(); }
     public override void OnDestroy() { TeardownInput(); base.OnDestroy(); }
-
     private void TeardownInput()
     {
         if (controls != null)
@@ -134,8 +139,7 @@ public class ShipControllerInputSystem : NetworkBehaviour
     {
         if (IsOwner)
         {
-            // Während Ladephase (GameLoadSync) nichts machen
-            if (!GameLoadSync.InputsAllowed)
+            if (!GameLoadSync.InputsAllowed || PauseMenuUI.IsOpen)
             {
                 fireInput = false;
                 MoveServerRpc(Vector2.zero, false);
@@ -151,11 +155,13 @@ public class ShipControllerInputSystem : NetworkBehaviour
     private void MoveServerRpc(Vector2 input, bool fire)
     {
         if (!GameLoadSync.InputsAllowed) { rb.linearVelocity = Vector2.zero; rb.angularVelocity = 0f; return; }
-        if (inKnockback) return;
+        if (inKnockback || isDead) return;
 
+        // Turn
         float turn = -input.x;
         rb.MoveRotation(rb.rotation + turn * turnSpeed * Time.fixedDeltaTime);
 
+        // Thrust / Brake
         if (input.y < 0f)
         {
             if (rb.linearVelocity.sqrMagnitude > 0.0001f)
@@ -178,16 +184,10 @@ public class ShipControllerInputSystem : NetworkBehaviour
     // --- Schießen (nur Server) ---
     private void FireServer()
     {
-        if (!GameLoadSync.InputsAllowed) return;
+        if (!GameLoadSync.InputsAllowed || isDead) return;
         if (projectilePrefab == null) return;
 
-        Vector2 dirWorld;
-        if (muzzle) dirWorld = muzzle.up;
-        else
-        {
-            float z = rb.rotation;
-            dirWorld = (Vector2)(Quaternion.Euler(0f, 0f, z) * Vector3.up);
-        }
+        Vector2 dirWorld = muzzle ? (Vector2)muzzle.up : (Vector2)(Quaternion.Euler(0, 0, rb.rotation) * Vector3.up);
         if (dirWorld.sqrMagnitude < 0.0001f) dirWorld = Vector2.up;
         dirWorld.Normalize();
 
@@ -197,6 +197,7 @@ public class ShipControllerInputSystem : NetworkBehaviour
 
         float angle = Mathf.Atan2(dirWorld.y, dirWorld.x) * Mathf.Rad2Deg + offDeg;
 
+        // Projektil-Spawn
         const float spawnOffset = 0.6f;
         Vector3 spawnPos = (muzzle ? muzzle.position : transform.position) + (Vector3)(dirWorld * spawnOffset);
         Quaternion spawnRot = Quaternion.Euler(0f, 0f, angle);
@@ -206,15 +207,17 @@ public class ShipControllerInputSystem : NetworkBehaviour
         if (go.TryGetComponent<Rigidbody2D>(out var prb))
             prb.SetRotation(angle);
 
-        // <<< IDs des Schützen
+        // IDs des Schützen
         var shooterNO = GetComponent<NetworkObject>();
-        ulong attackerCid = shooterNO ? shooterNO.OwnerClientId : OwnerClientId;
+        ulong shooterCid = shooterNO ? shooterNO.OwnerClientId : OwnerClientId;
         ulong shooterNoId = shooterNO ? shooterNO.NetworkObjectId : 0;
 
-        if (go.TryGetComponent<Projectile2D>(out var proj))
-            proj.Init(dirWorld, attackerCid, shooterNoId); // <<< Besitzer + Objekt-ID
+        Debug.Log($"[Ship.FireServer] spawn projectile by shooterCid={shooterCid} shooterNo={shooterNoId}");
 
-        // Eigene Schiffscollider ignorieren
+        if (go.TryGetComponent<Projectile2D>(out var proj))
+            proj.Init(dirWorld, shooterCid, shooterNoId);
+
+        // Eigene Collider ignorieren
         if (go.TryGetComponent<Collider2D>(out var projCol))
         {
             var ownerCols = GetComponentsInChildren<Collider2D>(true);
@@ -224,37 +227,95 @@ public class ShipControllerInputSystem : NetworkBehaviour
         var no = go.GetComponent<NetworkObject>();
         if (no != null) no.Spawn(true);
         else Debug.LogError("Projectile Prefab hat kein NetworkObject!", projectilePrefab);
+
+        // Muzzle-Flash (frei in der Welt, kein Parenting)
+        Vector3 muzzleFxPos = (muzzle ? muzzle.position : transform.position) + (Vector3)(dirWorld * muzzleFlashOffset);
+        PlayMuzzleFlashClientRpc(shooterNoId, muzzleFxPos, angle);
     }
 
     // --------- Schaden / Tod ---------
 
-    // alt kompatibel (ohne Angreifer): gilt als Environment/Other
-    [ServerRpc(RequireOwnership = false)]
-    public void ApplyDamageServerRpc(int dmg) => ApplyDamageServer(dmg, null, DeathCause.Other);
+    // Direkter Server-Entry inkl. Angreifer-Objekt-ID
+    public void ApplyDamageFromPlayerServer(int dmg, ulong attackerClientId, ulong attackerObjectId)
+    {
+        if (!IsServer) return;
 
-    // neu: von Spielerprojektilen
-    [ServerRpc(RequireOwnership = false)]
-    public void ApplyDamageFromPlayerServerRpc(int dmg, ulong attackerClientId) =>
-        ApplyDamageServer(dmg, attackerClientId, DeathCause.Projectile);
+        Debug.Log($"[Ship.ApplyDamageFromPlayerServer] victimCid={OwnerClientId} victimNo={GetComponent<NetworkObject>()?.NetworkObjectId} dmg={dmg} attackerCid={attackerClientId} attackerNo={attackerObjectId}");
 
-    // neu: von Umgebung (Asteroid etc.)
-    [ServerRpc(RequireOwnership = false)]
-    public void ApplyDamageFromEnvironmentServerRpc(int dmg, int causeCode) =>
-        ApplyDamageServer(dmg, null, (DeathCause)causeCode);
+        ApplyDamageServer(dmg, attackerClientId, DeathCause.Projectile, attackerObjectId);
+    }
 
-    private void ApplyDamageServer(int dmg, ulong? attackerCid, DeathCause cause)
+    [ServerRpc(RequireOwnership = false)]
+    public void ApplyDamageServerRpc(int dmg)
+    {
+        Debug.Log($"[Ship.ApplyDamageServerRpc] victimCid={OwnerClientId} dmg={dmg} cause=Other");
+        ApplyDamageServer(dmg, null, DeathCause.Other, null);
+    }
+
+    [ServerRpc(RequireOwnership = false)]
+    public void ApplyDamageFromPlayerServerRpc(int dmg, ulong attackerClientId)
+    {
+        Debug.Log($"[Ship.ApplyDamageFromPlayerServerRpc] victimCid={OwnerClientId} dmg={dmg} attackerCid={attackerClientId} (no attackerNoId via this RPC)");
+        ApplyDamageServer(dmg, attackerClientId, DeathCause.Projectile, null);
+    }
+
+    [ServerRpc(RequireOwnership = false)]
+    public void ApplyDamageFromEnvironmentServerRpc(int dmg, int causeCode)
+    {
+        Debug.Log($"[Ship.ApplyDamageFromEnvironmentServerRpc] victimCid={OwnerClientId} dmg={dmg} cause={(DeathCause)causeCode}");
+        ApplyDamageServer(dmg, null, (DeathCause)causeCode, null);
+    }
+
+    private void ApplyDamageServer(int dmg, ulong? attackerCid, DeathCause cause, ulong? attackerNoId)
     {
         if (!IsServer) return;
         if (hp.Value <= 0) return;
 
+        int oldHp = hp.Value;
         hp.Value = Mathf.Max(0, hp.Value - dmg);
+
+        Debug.Log($"[Ship.ApplyDamageServer] victimCid={OwnerClientId} victimNo={GetComponent<NetworkObject>()?.NetworkObjectId} oldHp={oldHp} newHp={hp.Value} " +
+                  $"attCid={(attackerCid.HasValue ? attackerCid.Value.ToString() : "null")} attNo={(attackerNoId.HasValue ? attackerNoId.Value.ToString() : "null")} cause={cause}");
 
         if (hp.Value == 0)
         {
-            // Killfeed:
+            isDead = true;
+
+            // Nur dem betroffenen Client das Death-Overlay zeigen
+            var target = new ClientRpcParams
+            {
+                Send = new ClientRpcSendParams
+                {
+                    TargetClientIds = new[] { OwnerClientId }
+                }
+            };
+            ShowDeathOverlayClientRpc(respawnDelay, target);
+
             if (GameEventRelay.Instance != null)
             {
-                if (attackerCid.HasValue && attackerCid.Value != OwnerClientId)
+                var myNO = GetComponent<NetworkObject>();
+                ulong victimNoId = myNO ? myNO.NetworkObjectId : 0;
+
+                bool hasAttackerNo = attackerNoId.HasValue && attackerNoId.Value != 0;
+                bool isSuicide;
+
+                // 1) Projektil: Objekt-ID entscheidet
+                if (cause == DeathCause.Projectile && hasAttackerNo)
+                {
+                    isSuicide = (attackerNoId.Value == victimNoId);
+                }
+                else
+                {
+                    // 2) Fallback: ClientId-Vergleich
+                    isSuicide = !(attackerCid.HasValue && attackerCid.Value != OwnerClientId);
+                }
+
+                Debug.Log($"[Ship.DeathDecision] victimCid={OwnerClientId} victimNo={victimNoId} " +
+                          $"attCid={(attackerCid.HasValue ? attackerCid.Value.ToString() : "null")} " +
+                          $"attNo={(attackerNoId.HasValue ? attackerNoId.Value.ToString() : "null")} " +
+                          $"cause={cause} -> isSuicide={isSuicide}");
+
+                if (!isSuicide && attackerCid.HasValue)
                     GameEventRelay.Instance.ServerAnnounceKill(attackerCid.Value, OwnerClientId, cause);
                 else
                     GameEventRelay.Instance.ServerAnnounceSuicide(OwnerClientId, cause);
@@ -266,16 +327,30 @@ public class ShipControllerInputSystem : NetworkBehaviour
 
     private IEnumerator RespawnRoutine()
     {
+        // Sicht/Hitbox aus
         SetActiveClientRpc(false);
         yield return new WaitForSeconds(respawnDelay);
 
+        // Server setzt Zustand zurück
         transform.SetPositionAndRotation(spawnPos, spawnRot);
         rb.linearVelocity = Vector2.zero;
         rb.angularVelocity = 0f;
         rb.WakeUp();
 
         hp.Value = maxHp;
+        isDead = false;
+
+        // Owner wieder aktivieren und Overlay sicherheitshalber schließen
         SetActiveClientRpc(true);
+
+        var target = new ClientRpcParams
+        {
+            Send = new ClientRpcSendParams
+            {
+                TargetClientIds = new[] { OwnerClientId }
+            }
+        };
+        HideDeathOverlayClientRpc(target);
     }
 
     [ClientRpc]
@@ -288,7 +363,7 @@ public class ShipControllerInputSystem : NetworkBehaviour
     public void ApplyKnockbackServer(Vector2 velocity)
     {
         if (!IsServer) return;
-        if (!GameLoadSync.InputsAllowed) return;
+        if (!GameLoadSync.InputsAllowed || isDead) return;
         rb.linearVelocity = velocity;
         rb.WakeUp();
         KnockbackClientRpc();
@@ -299,6 +374,32 @@ public class ShipControllerInputSystem : NetworkBehaviour
     {
         inKnockback = true;
         knockbackTimer = knockbackDuration;
+    }
+
+    // ---------- VFX RPCs ----------
+
+    [ClientRpc]
+    private void PlayMuzzleFlashClientRpc(ulong shooterNoId, Vector3 worldPos, float angleZ)
+    {
+        if (!muzzleFlashPrefab) return;
+        var rot = Quaternion.Euler(0f, 0f, angleZ);
+        Instantiate(muzzleFlashPrefab, worldPos, rot);
+    }
+
+    // ---------- Death Overlay RPCs (nur Ziel-Client) ----------
+
+    [ClientRpc]
+    private void ShowDeathOverlayClientRpc(float duration, ClientRpcParams target = default)
+    {
+        if (DeathOverlay.I != null)
+            DeathOverlay.I.ShowFor(duration);
+    }
+
+    [ClientRpc]
+    private void HideDeathOverlayClientRpc(ClientRpcParams target = default)
+    {
+        if (DeathOverlay.I != null)
+            DeathOverlay.I.HideImmediate();
     }
 
 #if UNITY_EDITOR

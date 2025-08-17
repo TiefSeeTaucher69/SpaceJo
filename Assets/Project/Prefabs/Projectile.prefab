@@ -217,6 +217,7 @@ MonoBehaviour:
   damage: 20
   lifetime: 3
   rotationOffsetDegrees: -90
+  explosionPrefab: {fileID: 100002, guid: 9e0340bae1156d347895e49a66fbcb42, type: 3}
 --- !u!114 &2870996008573633411
 MonoBehaviour:
   m_ObjectHideFlags: 0

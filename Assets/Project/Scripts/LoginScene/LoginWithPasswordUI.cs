@@ -8,25 +8,29 @@ using System.Threading.Tasks;
 public class LoginWithPasswordUI : MonoBehaviour
 {
     [Header("UI References")]
+    [Tooltip("Panel mit allen manuellen Loginfeldern (im Inspector DEAKTIVIERT lassen!).")]
+    public GameObject loginPanel;   // Deaktiviert im Inspector, nur zeigen wenn nötig
     public TMP_InputField usernameField;
     public TMP_InputField passwordField;
     public Button signUpBtn;
     public Button signInBtn;
     public TMP_Text feedback;
-    [Tooltip("Optional: Spinner/Overlay während Auto-Login/Requests.")]
-    public GameObject busyOverlay;
 
     const string DisplayNameKey = "display_name";
 
     async void Awake()
     {
+        // Panel sicherheitshalber aus
+        if (loginPanel) loginPanel.SetActive(false);
+
+        // Passwortfeld maskieren
         if (passwordField != null)
         {
             passwordField.contentType = TMP_InputField.ContentType.Password;
             passwordField.ForceLabelUpdate();
         }
 
-        // evtl. gespeicherten Anzeigenamen vorfüllen
+        // ggf. gespeicherten Anzeigenamen vorfüllen
         var saved = PlayerPrefs.GetString(DisplayNameKey, string.Empty);
         if (!string.IsNullOrWhiteSpace(saved))
         {
@@ -35,58 +39,80 @@ public class LoginWithPasswordUI : MonoBehaviour
                 usernameField.text = saved;
         }
 
-        await UnityServices.InitializeAsync();
+        // Globalen Loading Screen zeigen
+        if (LoadingOverlay.I != null)
+            await LoadingOverlay.I.Show("Prüfe Anmeldung …");
 
-        // ---- Silent Sign-In mit gecachter Session ----
-        if (AuthenticationService.Instance.SessionTokenExists)
+        bool goToMenu = false; // -> nach finally wird Szene geladen
+
+        try
         {
-            SetBusy(true);
-            try
+            await UnityServices.InitializeAsync();
+
+            // Silent Sign-In mit gecachter Session
+            if (AuthenticationService.Instance.SessionTokenExists)
             {
-                // NEU: cached player via Anonymous-SignIn reaktivieren
-                await AuthenticationService.Instance.SignInAnonymouslyAsync(); // nutzt das gespeicherte Session-Token
+                try
+                {
+                    // Anonymous reaktiviert ggf. bestehende anonyme Session
+                    await AuthenticationService.Instance.SignInAnonymouslyAsync();
+                    EnsureDisplayNameFallback();
+                    goToMenu = true;
+                }
+                catch
+                {
+                    SetFeedback("Sitzung abgelaufen – bitte erneut einloggen.");
+                }
+            }
+
+            // Falls bereits eingeloggt (z. B. aus Editor)
+            if (!goToMenu && AuthenticationService.Instance.IsSignedIn)
+            {
                 EnsureDisplayNameFallback();
-                SceneLoader.I.Load(AppScene.MainMenuScene);
-                return;
+                goToMenu = true;
             }
-            catch
-            {
-                feedback.text = "Sitzung abgelaufen – bitte erneut einloggen.";
-            }
-            finally
-            {
-                SetBusy(false);
-            }
+        }
+        finally
+        {
+            // Overlay IMMER schließen bevor wir irgendwas anzeigen/wechseln
+            if (LoadingOverlay.I != null)
+                await LoadingOverlay.I.Hide();
         }
 
-        // Falls aus irgendeinem Grund schon eingeloggt, direkt weiter
-        if (AuthenticationService.Instance.IsSignedIn)
+        if (goToMenu)
         {
-            EnsureDisplayNameFallback();
+            // Jetzt ist das Overlay sicher weg -> Menü laden
             SceneLoader.I.Load(AppScene.MainMenuScene);
+            return;
         }
+
+        // Manueller Login nötig
+        if (loginPanel) loginPanel.SetActive(true);
+        SetBusy(false);
+        FocusUserField();
     }
 
     void Start()
     {
-        signUpBtn.onClick.AddListener(() => { _ = DoSignUp(); });
-        signInBtn.onClick.AddListener(() => { _ = DoSignIn(); });
+        if (signUpBtn) signUpBtn.onClick.AddListener(() => { _ = DoSignUp(); });
+        if (signInBtn) signInBtn.onClick.AddListener(() => { _ = DoSignIn(); });
     }
 
     async Task DoSignUp()
     {
         try
         {
-            string u = usernameField.text.Trim();
-            string p = passwordField.text;
+            string u = usernameField ? usernameField.text.Trim() : "";
+            string p = passwordField ? passwordField.text : "";
 
             if (string.IsNullOrEmpty(u) || string.IsNullOrEmpty(p))
             {
-                feedback.text = "Bitte Benutzername und Passwort eingeben.";
+                SetFeedback("Bitte Benutzername und Passwort eingeben.");
                 return;
             }
 
             SetBusy(true);
+            if (LoadingOverlay.I != null) await LoadingOverlay.I.Show("Erstelle Account …");
 
             if (!AuthenticationService.Instance.IsSignedIn)
                 await AuthenticationService.Instance.SignInAnonymouslyAsync();
@@ -96,34 +122,49 @@ public class LoginWithPasswordUI : MonoBehaviour
             AuthenticationService.Instance.SignOut();
             await AuthenticationService.Instance.SignInWithUsernamePasswordAsync(u, p);
 
+            // Overlay erst schließen, dann Szene wechseln (damit es nicht „hängen“ bleibt)
+            if (LoadingOverlay.I != null) await LoadingOverlay.I.Hide();
             OnSignedIn(u);
         }
-        catch (RequestFailedException e) { feedback.text = $"Registrierung fehlgeschlagen: {e.Message}"; }
-        catch (System.Exception e) { feedback.text = $"Fehler: {e.Message}"; }
-        finally { SetBusy(false); }
+        catch (RequestFailedException e) { SetFeedback($"Registrierung fehlgeschlagen: {e.Message}"); }
+        catch (System.Exception e) { SetFeedback($"Fehler: {e.Message}"); }
+        finally
+        {
+            SetBusy(false);
+            // Falls oben kein Erfolg war, Overlay schließen
+            if (LoadingOverlay.I != null) await LoadingOverlay.I.Hide();
+        }
     }
 
     async Task DoSignIn()
     {
         try
         {
-            string u = usernameField.text.Trim();
-            string p = passwordField.text;
+            string u = usernameField ? usernameField.text.Trim() : "";
+            string p = passwordField ? passwordField.text : "";
 
             if (string.IsNullOrEmpty(u) || string.IsNullOrEmpty(p))
             {
-                feedback.text = "Bitte Benutzername und Passwort eingeben.";
+                SetFeedback("Bitte Benutzername und Passwort eingeben.");
                 return;
             }
 
             SetBusy(true);
+            if (LoadingOverlay.I != null) await LoadingOverlay.I.Show("Anmeldung …");
+
             await AuthenticationService.Instance.SignInWithUsernamePasswordAsync(u, p);
 
+            if (LoadingOverlay.I != null) await LoadingOverlay.I.Hide();
             OnSignedIn(u);
         }
-        catch (RequestFailedException e) { feedback.text = $"Login fehlgeschlagen: {e.Message}"; }
-        catch (System.Exception e) { feedback.text = $"Fehler: {e.Message}"; }
-        finally { SetBusy(false); }
+        catch (RequestFailedException e) { SetFeedback($"Login fehlgeschlagen: {e.Message}"); }
+        catch (System.Exception e) { SetFeedback($"Fehler: {e.Message}"); }
+        finally
+        {
+            SetBusy(false);
+            // Falls oben kein Erfolg -> Overlay schließen
+            if (LoadingOverlay.I != null) await LoadingOverlay.I.Hide();
+        }
     }
 
     // -------- Helpers --------
@@ -134,7 +175,7 @@ public class LoginWithPasswordUI : MonoBehaviour
         UgsBootstrap.DisplayName = dn;
         PlayerPrefs.SetString(DisplayNameKey, dn);
 
-        // Session-Token wird vom SDK automatisch persistiert -> nächster Start autologin.
+        // KEIN erneutes Show() hier – damit bleibt nichts hängen
         SceneLoader.I.Load(AppScene.MainMenuScene);
     }
 
@@ -156,6 +197,21 @@ public class LoginWithPasswordUI : MonoBehaviour
         if (signInBtn) signInBtn.interactable = !busy;
         if (usernameField) usernameField.interactable = !busy;
         if (passwordField) passwordField.interactable = !busy;
-        if (busyOverlay) busyOverlay.SetActive(busy);
+    }
+
+    void SetFeedback(string msg)
+    {
+        if (feedback) feedback.text = msg ?? "";
+        if (!string.IsNullOrEmpty(msg))
+            Debug.Log(msg);
+    }
+
+    void FocusUserField()
+    {
+        if (usernameField)
+        {
+            usernameField.Select();
+            usernameField.ActivateInputField();
+        }
     }
 }
