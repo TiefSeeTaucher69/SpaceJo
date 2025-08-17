@@ -1,6 +1,6 @@
 ﻿using UnityEngine;
 using UnityEngine.UI;
-using TMPro; // TMP_InputField, TMP_Text
+using TMPro;
 using Unity.Services.Core;
 using Unity.Services.Authentication;
 using System.Threading.Tasks;
@@ -8,8 +8,7 @@ using System.Threading.Tasks;
 public class LoginWithPasswordUI : MonoBehaviour
 {
     [Header("UI References")]
-    [Tooltip("Panel mit allen manuellen Loginfeldern (im Inspector DEAKTIVIERT lassen!).")]
-    public GameObject loginPanel;   // Deaktiviert im Inspector, nur zeigen wenn nötig
+    public GameObject loginPanel;   // im Inspector deaktiviert lassen
     public TMP_InputField usernameField;
     public TMP_InputField passwordField;
     public Button signUpBtn;
@@ -17,20 +16,24 @@ public class LoginWithPasswordUI : MonoBehaviour
     public TMP_Text feedback;
 
     const string DisplayNameKey = "display_name";
+    const string LOG = "[LoginWithPasswordUI]";
+
+    // Schutz gegen parallele Restores (über Szenenobjekte hinweg)
+    private static Task<bool> s_RestoreTask;
+    private static bool s_RestoreResult;
 
     async void Awake()
     {
-        // Panel sicherheitshalber aus
+        var id = GetInstanceID();
         if (loginPanel) loginPanel.SetActive(false);
 
-        // Passwortfeld maskieren
         if (passwordField != null)
         {
             passwordField.contentType = TMP_InputField.ContentType.Password;
             passwordField.ForceLabelUpdate();
         }
 
-        // ggf. gespeicherten Anzeigenamen vorfüllen
+        // evtl. Anzeigename vorfüllen
         var saved = PlayerPrefs.GetString(DisplayNameKey, string.Empty);
         if (!string.IsNullOrWhiteSpace(saved))
         {
@@ -39,57 +42,64 @@ public class LoginWithPasswordUI : MonoBehaviour
                 usernameField.text = saved;
         }
 
-        // Globalen Loading Screen zeigen
         if (LoadingOverlay.I != null)
             await LoadingOverlay.I.Show("Prüfe Anmeldung …");
 
-        bool goToMenu = false; // -> nach finally wird Szene geladen
+        bool restoredOk = false;
 
         try
         {
             await UnityServices.InitializeAsync();
 
-            // Silent Sign-In mit gecachter Session
-            if (AuthenticationService.Instance.SessionTokenExists)
+            // Wenn "IsSignedIn=true" aber kein Token -> harte Bereinigung
+            if (!AuthenticationService.Instance.SessionTokenExists && AuthenticationService.Instance.IsSignedIn)
             {
-                try
-                {
-                    // Anonymous reaktiviert ggf. bestehende anonyme Session
-                    await AuthenticationService.Instance.SignInAnonymouslyAsync();
-                    EnsureDisplayNameFallback();
-                    goToMenu = true;
-                }
-                catch
-                {
-                    SetFeedback("Sitzung abgelaufen – bitte erneut einloggen.");
-                }
+                Debug.Log($"{LOG}#{id} IsSignedIn=true aber kein SessionToken -> SignOut()");
+                AuthenticationService.Instance.SignOut();
             }
 
-            // Falls bereits eingeloggt (z. B. aus Editor)
-            if (!goToMenu && AuthenticationService.Instance.IsSignedIn)
+            // Deduplicate: nur **ein** Restore-Task gleichzeitig
+            if (s_RestoreTask == null)
             {
-                EnsureDisplayNameFallback();
-                goToMenu = true;
+                s_RestoreTask = TryRestoreSessionInternal(id);
+                s_RestoreResult = await s_RestoreTask;
+                s_RestoreTask = null;
             }
+            else
+            {
+                // auf laufenden Restore warten
+                s_RestoreResult = await s_RestoreTask;
+            }
+
+            restoredOk = s_RestoreResult;
+            Debug.Log($"{LOG}#{id} After Restore: restoredOk={restoredOk}, IsSignedIn={AuthenticationService.Instance.IsSignedIn}, HasToken={AuthenticationService.Instance.SessionTokenExists}");
         }
         finally
         {
-            // Overlay IMMER schließen bevor wir irgendwas anzeigen/wechseln
             if (LoadingOverlay.I != null)
                 await LoadingOverlay.I.Hide();
         }
 
-        if (goToMenu)
+        if (restoredOk && AuthenticationService.Instance.IsSignedIn)
         {
-            // Jetzt ist das Overlay sicher weg -> Menü laden
+            Debug.Log($"{LOG}#{id} Auto-Login OK -> lade MainMenu.");
             SceneLoader.I.Load(AppScene.MainMenuScene);
             return;
         }
 
-        // Manueller Login nötig
+        // Sicherstellen, dass wir in einem klaren "nicht eingeloggt"-Zustand sind
+        if (AuthenticationService.Instance.IsSignedIn)
+        {
+            Debug.Log($"{LOG}#{id} Restore scheiterte, aber IsSignedIn==true -> SignOut() (Konsistenz).");
+            AuthenticationService.Instance.SignOut();
+        }
+
+        // manueller Login
         if (loginPanel) loginPanel.SetActive(true);
         SetBusy(false);
         FocusUserField();
+
+        Debug.Log($"{LOG}#{id} Zeige Login-Panel. IsSignedIn={AuthenticationService.Instance.IsSignedIn}, HasToken={AuthenticationService.Instance.SessionTokenExists}");
     }
 
     void Start()
@@ -98,6 +108,63 @@ public class LoginWithPasswordUI : MonoBehaviour
         if (signInBtn) signInBtn.onClick.AddListener(() => { _ = DoSignIn(); });
     }
 
+    // ---------- Restore intern, idempotent ----------
+    private async Task<bool> TryRestoreSessionInternal(int id)
+    {
+        // Bereits eingeloggt? -> Erfolg (idempotent)
+        if (AuthenticationService.Instance.IsSignedIn)
+        {
+            Debug.Log($"{LOG}#{id} Restore: schon eingeloggt -> OK");
+            EnsureDisplayNameFallback();
+            return true;
+        }
+
+        if (!AuthenticationService.Instance.SessionTokenExists)
+        {
+            Debug.Log($"{LOG}#{id} Kein SessionToken -> kein Restore.");
+            return false;
+        }
+
+        try
+        {
+            // Unity Auth: ruft bei vorhandenem Token die Session wieder her
+            await AuthenticationService.Instance.SignInAnonymouslyAsync();
+            EnsureDisplayNameFallback();
+            Debug.Log($"{LOG}#{id} Silent restore OK (anonymous reactivated).");
+            return true;
+        }
+        catch (RequestFailedException e)
+        {
+            // Wenn wir trotz Exception am Ende eingeloggt sind (race/parallel): Erfolg
+            if (AuthenticationService.Instance.IsSignedIn)
+            {
+                Debug.Log($"{LOG}#{id} Restore warf '{e.Message}', aber IsSignedIn==true -> OK");
+                EnsureDisplayNameFallback();
+                return true;
+            }
+
+            SetFeedback("Sitzung abgelaufen – bitte erneut einloggen.");
+            Debug.Log($"{LOG}#{id} Silent restore FAILED -> SignOut()");
+            AuthenticationService.Instance.SignOut();
+            return false;
+        }
+        catch (System.Exception e)
+        {
+            if (AuthenticationService.Instance.IsSignedIn)
+            {
+                Debug.Log($"{LOG}#{id} Restore Exception '{e.Message}', aber IsSignedIn==true -> OK");
+                EnsureDisplayNameFallback();
+                return true;
+            }
+
+            SetFeedback("Sitzung abgelaufen – bitte erneut einloggen.");
+            Debug.Log($"{LOG}#{id} Silent restore FAILED (Exception) -> SignOut()");
+            AuthenticationService.Instance.SignOut();
+            return false;
+        }
+    }
+
+    // ---------- Sign Up ----------
     async Task DoSignUp()
     {
         try
@@ -122,7 +189,6 @@ public class LoginWithPasswordUI : MonoBehaviour
             AuthenticationService.Instance.SignOut();
             await AuthenticationService.Instance.SignInWithUsernamePasswordAsync(u, p);
 
-            // Overlay erst schließen, dann Szene wechseln (damit es nicht „hängen“ bleibt)
             if (LoadingOverlay.I != null) await LoadingOverlay.I.Hide();
             OnSignedIn(u);
         }
@@ -131,11 +197,11 @@ public class LoginWithPasswordUI : MonoBehaviour
         finally
         {
             SetBusy(false);
-            // Falls oben kein Erfolg war, Overlay schließen
             if (LoadingOverlay.I != null) await LoadingOverlay.I.Hide();
         }
     }
 
+    // ---------- Sign In ----------
     async Task DoSignIn()
     {
         try
@@ -162,7 +228,6 @@ public class LoginWithPasswordUI : MonoBehaviour
         finally
         {
             SetBusy(false);
-            // Falls oben kein Erfolg -> Overlay schließen
             if (LoadingOverlay.I != null) await LoadingOverlay.I.Hide();
         }
     }
@@ -174,8 +239,7 @@ public class LoginWithPasswordUI : MonoBehaviour
         var dn = string.IsNullOrWhiteSpace(enteredUsername) ? "Pilot" : enteredUsername;
         UgsBootstrap.DisplayName = dn;
         PlayerPrefs.SetString(DisplayNameKey, dn);
-
-        // KEIN erneutes Show() hier – damit bleibt nichts hängen
+        Debug.Log($"{LOG} SignIn erfolgreich -> lade MainMenu.");
         SceneLoader.I.Load(AppScene.MainMenuScene);
     }
 
